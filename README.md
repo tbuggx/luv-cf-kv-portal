@@ -60,3 +60,35 @@ CF-Workers-TEXT2KV 是一个在 Cloudflare Workers 上运行的无服务器应�
 Workers 会自动将新内容存储到对应的文件中。
 
 通过这个无服务器应用,您可以方便地在 Cloudflare 的分布式网络上存储和管理文本文件,同时享受高性能和安全可靠的优势。欢迎使用 CF-Workers-TEXT2KV!
+
+---
+
+## luvium 定制说明（2026-11-24）
+
+本实例在原版基础上加了 **TOTP 双因素认证** 与 **写白名单**。
+
+### 鉴权
+
+| 接口 | 参数 | 说明 |
+|---|---|---|
+| 读文件 | `GET /<key>?token=<TOKEN>&otp=<6位码>` | 6 位码约 60 秒有效 |
+| 写 KV | `GET /<key>?token=<TOKEN>&otp=<6位码>&b64=<内容>` | 文件名须在 `WRITE_KEYS` 白名单内 |
+| 配置页 | `GET /config?token=<TOKEN>&otp=<6位码>` | 会回显 TOKEN，故同样需要 OTP |
+
+- TOTP：RFC 6238，HMAC-SHA1，6 位，30 秒步长，校验容忍 ±1 步 → 每个码约 60 秒有效
+- KV key 只取路径最后一段（`/subscribes/cf.yaml` → `cf.yaml`）
+
+### 环境变量（Cloudflare Pages 项目设置里配）
+
+| 变量 | 类型 | 说明 |
+|---|---|---|
+| `TOKEN` | plain_text | 固定访问口令 |
+| `TOTP_SECRET` | secret_text | Base32 格式的 TOTP 密钥（Microsoft Authenticator 等） |
+| `WRITE_KEYS` | plain_text | 允许写入的文件名白名单，逗号分隔；留空=不限制 |
+| `READ_REQUIRE_OTP` | plain_text | `1`=读也强制 OTP（默认 `1`）；`0`=读只要 token |
+
+### 部署注意
+
+- 本项目为 Pages **Functions** 模式，入口文件必须是 `_worker.js`（不是 `worker.js`）。
+- 直接用 Pages API 上传会退化成「拉仓库构建」，必须用 `wrangler pages deploy` 或 GitHub 推送触发。
+- `TOTP_SECRET` 用 `wrangler pages secret put TOTP_SECRET --project-name <项目名>` 设置（加密存储）。

@@ -10,13 +10,31 @@ export default {
             }
 
             const url = new URL(request.url);
-            const token = url.pathname === `/${mytoken}` ? mytoken : (url.searchParams.get('token') || "null");
+            // 只取最后一段作为 KV key（/subscribes/cf.yaml -> cf.yaml）
+            let fileName = url.pathname.split('/').filter(Boolean).pop() || '';
 
+            const token = url.pathname === `/${mytoken}` ? mytoken : (url.searchParams.get('token') || "null");
+            const isWrite = !!(url.searchParams.get('text') || url.searchParams.get('b64'));
+
+            // ---- 鉴权：token + OTP（读、写、配置页都需要）----
             if (token !== mytoken) {
                 return createResponse('token 有误', 403);
             }
 
-            let fileName = url.pathname.startsWith('/') ? url.pathname.substring(1) : url.pathname;
+            const needOtp = isWrite
+                || env.READ_REQUIRE_OTP === '1'
+                || url.pathname === '/config' || url.pathname.startsWith('/config/');
+
+            if (needOtp) {
+                const otp = url.searchParams.get('otp') || '';
+                if (!env.TOTP_SECRET) {
+                    return createResponse('服务端未配置 TOTP_SECRET', 500);
+                }
+                if (!(await verifyTotp(env.TOTP_SECRET, otp))) {
+                    return createResponse('OTP 有误或已过期', 403);
+                }
+            }
+
             //fileName = fileName.toLowerCase(); // 将文件名转换为小写
 
             switch (fileName) {
@@ -28,7 +46,7 @@ export default {
                 case "config/update.sh":
                     return createResponse(generateShScript(url.hostname, token), 200, { "Content-Disposition": 'attachment; filename=update.sh', "Content-Type": "text/plain; charset=utf-8" });
                 default:
-                    return await handleFileOperation(env.KV, fileName, url, token);
+                    return await handleFileOperation(env, fileName, url, token);
             }
         } catch (error) {
             console.error("Error:", error);
@@ -44,7 +62,8 @@ export default {
  * @param {Object} url - URL 实例
  * @param {String} token - 认证 token
  */
-async function handleFileOperation(KV, fileName, url, token) {
+async function handleFileOperation(env, fileName, url, token) {
+    const KV = env.KV;
     const text = url.searchParams.get('text') || null;
     const b64 = url.searchParams.get('b64') || null;
 
@@ -59,6 +78,13 @@ async function handleFileOperation(KV, fileName, url, token) {
 
     // 如果传递了 text 或 b64 参数，将内容写入 KV 存储
     let content = text || base64Decode(replaceSpacesWithPlus(b64));
+
+    // 写白名单（env.WRITE_KEYS，逗号分隔；留空表示不限制）
+    const writeKeys = (env.WRITE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (writeKeys.length && !writeKeys.includes(fileName)) {
+        return createResponse('该文件名不在允许写入的范围内', 403);
+    }
+
     await KV.put(fileName, content);
     const verifiedContent = await KV.get(fileName, { cacheTtl: 60 });
 
@@ -68,6 +94,67 @@ async function handleFileOperation(KV, fileName, url, token) {
 
     return createResponse(verifiedContent);
 }
+
+
+/**
+ * Base32 解码（RFC 4648，去掉填充 =）
+ */
+function base32Decode(str) {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+    let bits = '';
+    for (const ch of str.replace(/=+$/i, '').toUpperCase()) {
+        const idx = alphabet.indexOf(ch);
+        if (idx === -1) continue;
+        bits += idx.toString(2).padStart(5, '0');
+    }
+    const bytes = [];
+    for (let i = 0; i + 8 <= bits.length; i += 8) {
+        bytes.push(parseInt(bits.substr(i, 8), 2));
+    }
+    return new Uint8Array(bytes);
+}
+
+/**
+ * 计算 TOTP（RFC 6238, HMAC-SHA1, 6 位, 30 秒）
+ */
+async function totpCode(secretB32, offset = 0) {
+    const key = await crypto.subtle.importKey(
+        'raw', base32Decode(secretB32), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
+    );
+    const counter = Math.floor(Date.now() / 1000 / 30) + offset;
+    const buf = new ArrayBuffer(8);
+    new DataView(buf).setBigUint64(0, BigInt(counter));
+    const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, buf));
+    const off = sig[sig.length - 1] & 0x0f;
+    const bin = ((sig[off] & 0x7f) << 24) | (sig[off + 1] << 16) | (sig[off + 2] << 8) | sig[off + 3];
+    return String(bin % 1000000).padStart(6, '0');
+}
+
+/**
+ * 校验 TOTP，允许 ±1 个时间步（容忍时钟漂移）
+ */
+async function verifyTotp(secretB32, code) {
+    const input = String(code || '').trim();
+    if (!/^\d{6}$/.test(input)) return false;
+    for (const offset of [0, -1, 1]) {
+        const expected = await totpCode(secretB32, offset);
+        if (timingSafeEqual(expected, input)) return true;
+    }
+    return false;
+}
+
+/**
+ * 常量时间字符串比较
+ */
+function timingSafeEqual(a, b) {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+}
+
+
+
 
 /**
  * 创建 HTTP 响应
@@ -128,7 +215,8 @@ function generateBatScript(domain, token) {
         '',
         'for /f "delims=" %%i in (\'powershell -command "$content = ((Get-Content -Path \'%cd%/%FILENAME%\' -Encoding UTF8) | Select-Object -First 65) -join [Environment]::NewLine; [convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($content))"\') do set "BASE64_TEXT=%%i"',
         '',
-        'set "URL=https://%DOMAIN%/%FILENAME%?token=%TOKEN%^&b64=%BASE64_TEXT%"',
+        'set "OTP=%~2"',
+        'set "URL=https://%DOMAIN%/%FILENAME%?token=%TOKEN%^&otp=%OTP%^&b64=%BASE64_TEXT%"',
         '',
         'start %URL%',
         'endlocal',
@@ -156,7 +244,9 @@ else
   exit 1
 fi
 BASE64_TEXT=$(head -n 65 $FILENAME | base64 -w 0)
-curl -k "https://\${DOMAIN}/\${FILENAME}?token=\${TOKEN}&b64=\${BASE64_TEXT}"
+OTP=\${2:-$OTP}
+if [ -z "$OTP" ]; then echo "用法: $0 <文件名> <6位OTP码>"; exit 1; fi
+curl -k "https://\${DOMAIN}/\${FILENAME}?token=\${TOKEN}&otp=\${OTP}&b64=\${BASE64_TEXT}"
 echo "更新数据完成"
 `;
 }
@@ -277,7 +367,7 @@ function configHTML(domain, token) {
             <h2>Windows 脚本:</h2>
             <button class="download-button" onclick="window.open('https://${domain}/config/update.bat?token=${token}&t=' + Date.now(), '_blank')">点击下载</button>
         </div>
-            <pre><code>update.bat ip.txt</code></pre>
+            <pre><code>update.bat ip.txt 123456</code></pre>
         <div class="flex-row">
             <h2>Linux 脚本:</h2>
             <button class="download-button" onclick="copyLinuxScript()">点击复制</button>
