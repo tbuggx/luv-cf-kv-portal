@@ -71,12 +71,12 @@ Workers 会自动将新内容存储到对应的文件中。
 
 | 接口 | 参数 | 说明 |
 |---|---|---|
-| 读文件 | `GET /<key>?token=<TOKEN>&otp=<6位码>` | 6 位码约 60 秒有效 |
+| 读文件 | `GET /<key>?token=<TOKEN>&otp=<6位码>` | 6 位码默认约 5 分钟有效（`TOTP_WINDOW`） |
 | 写 KV | `GET /<key>?token=<TOKEN>&otp=<6位码>&b64=<内容>` | 文件名须在 `WRITE_KEYS` 白名单内 |
 | 配置页 | `GET /config?token=<TOKEN>&otp=<6位码>` | 会回显 TOKEN，故同样需要 OTP |
 
-- TOTP：RFC 6238，HMAC-SHA1，6 位，30 秒步长，校验容忍 ±1 步 → 每个码约 60 秒有效
-- KV key 只取路径最后一段（`/subscribes/cf.yaml` → `cf.yaml`）
+- TOTP：RFC 6238，HMAC-SHA1，6 位，30 秒步长；向前额外接受 `TOTP_WINDOW/步长` 个旧码 → 每个码默认 5 分钟有效
+- KV key 只取路径最后一段（`/subscribes/clash.yaml` → `clash.yaml`）
 
 ### 环境变量（Cloudflare Pages 项目设置里配）
 
@@ -86,6 +86,9 @@ Workers 会自动将新内容存储到对应的文件中。
 | `TOTP_SECRET` | secret_text | Base32 格式的 TOTP 密钥（Microsoft Authenticator 等） |
 | `WRITE_KEYS` | plain_text | 允许写入的文件名白名单，逗号分隔；留空=不限制 |
 | `READ_REQUIRE_OTP` | plain_text | `1`=读也强制 OTP（默认 `1`）；`0`=读只要 token |
+| `TOTP_PERIOD` | plain_text | 步长秒数，默认 `30`（须与 Authenticator 一致） |
+| `TOTP_WINDOW` | plain_text | 码的有效时长秒数，默认 `300`（=10 步，5 分钟） |
+| `TOTP_SKEW_STEPS` | plain_text | 允许的时钟超前步数，默认 `1` |
 
 ### 部署注意
 
