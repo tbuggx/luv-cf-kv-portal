@@ -30,7 +30,7 @@ export default {
                 if (!env.TOTP_SECRET) {
                     return createResponse('服务端未配置 TOTP_SECRET', 500);
                 }
-                if (!(await verifyTotp(env.TOTP_SECRET, otp))) {
+                if (!(await verifyTotp(env.TOTP_SECRET, otp, env))) {
                     return createResponse('OTP 有误或已过期', 403);
                 }
             }
@@ -117,11 +117,11 @@ function base32Decode(str) {
 /**
  * 计算 TOTP（RFC 6238, HMAC-SHA1, 6 位, 30 秒）
  */
-async function totpCode(secretB32, offset = 0) {
+async function totpCode(secretB32, offset = 0, period = 30) {
     const key = await crypto.subtle.importKey(
         'raw', base32Decode(secretB32), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']
     );
-    const counter = Math.floor(Date.now() / 1000 / 30) + offset;
+    const counter = Math.floor(Date.now() / 1000 / period) + offset;
     const buf = new ArrayBuffer(8);
     new DataView(buf).setBigUint64(0, BigInt(counter));
     const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, buf));
@@ -133,11 +133,21 @@ async function totpCode(secretB32, offset = 0) {
 /**
  * 校验 TOTP，允许 ±1 个时间步（容忍时钟漂移）
  */
-async function verifyTotp(secretB32, code) {
+async function verifyTotp(secretB32, code, env) {
     const input = String(code || '').trim();
     if (!/^\d{6}$/.test(input)) return false;
-    for (const offset of [0, -1, 1]) {
-        const expected = await totpCode(secretB32, offset);
+
+    // 步长（与 Authenticator 一致，默认 30 秒）
+    const period = Number(env.TOTP_PERIOD || 30);
+    // 码的有效时长（秒）：旧码在窗口内继续可用
+    const windowSec = Number(env.TOTP_WINDOW || 600);
+    // 允许的时钟超前步数
+    const skew = Number(env.TOTP_SKEW_STEPS || 1);
+    // 向前接受的步数 = 有效时长 / 步长
+    const back = Math.max(0, Math.floor(windowSec / period));
+
+    for (let offset = -back; offset <= skew; offset++) {
+        const expected = await totpCode(secretB32, offset, period);
         if (timingSafeEqual(expected, input)) return true;
     }
     return false;
